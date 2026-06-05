@@ -17,6 +17,16 @@ ANALYSIS_COOLDOWN="${ECC_OBSERVER_ANALYSIS_COOLDOWN:-60}"
 IDLE_TIMEOUT_SECONDS="${ECC_OBSERVER_IDLE_TIMEOUT_SECONDS:-1800}"
 SESSION_LEASE_DIR="${PROJECT_DIR}/.observer-sessions"
 ACTIVITY_FILE="${PROJECT_DIR}/.observer-last-activity"
+OBSERVER_START_EPOCH="$(date +%s)"
+
+# Detect stat mtime flag once at startup to avoid double-fork per file_mtime_epoch call
+if stat -c %Y "$0" >/dev/null 2>&1; then
+  _STAT_MTIME="stat -c %Y"
+elif stat -f %m "$0" >/dev/null 2>&1; then
+  _STAT_MTIME="stat -f %m"
+else
+  _STAT_MTIME=""
+fi
 
 cleanup() {
   [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
@@ -33,18 +43,11 @@ file_mtime_epoch() {
     printf '0\n'
     return
   fi
-
-  if stat -c %Y "$file" >/dev/null 2>&1; then
-    stat -c %Y "$file" 2>/dev/null || printf '0\n'
-    return
+  if [ -n "$_STAT_MTIME" ]; then
+    $_STAT_MTIME "$file" 2>/dev/null || printf '0\n'
+  else
+    printf '0\n'
   fi
-
-  if stat -f %m "$file" >/dev/null 2>&1; then
-    stat -f %m "$file" 2>/dev/null || printf '0\n'
-    return
-  fi
-
-  printf '0\n'
 }
 
 has_active_session_leases() {
@@ -52,7 +55,22 @@ has_active_session_leases() {
     return 1
   fi
 
-  find "$SESSION_LEASE_DIR" -type f -name '*.json' -print -quit 2>/dev/null | grep -q .
+  # No lease files at all
+  find "$SESSION_LEASE_DIR" -type f -name '*.json' -print -quit 2>/dev/null | grep -q . || return 1
+
+  # Lease files exist but check if activity is stale — guards against leases left
+  # behind by sessions killed with SIGKILL where SessionEnd never fired.
+  local activity_epoch now_epoch idle_for
+  activity_epoch="$(file_mtime_epoch "$ACTIVITY_FILE")"
+  if [ "$activity_epoch" -eq 0 ] 2>/dev/null; then
+    return 0  # no activity file yet; conservatively assume leases are live
+  fi
+  now_epoch="$(date +%s)"
+  idle_for=$(( now_epoch - activity_epoch ))
+  if [ "$idle_for" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
+    return 1  # activity stale for full timeout — treat leases as orphaned
+  fi
+  return 0
 }
 
 latest_activity_epoch() {
@@ -75,9 +93,17 @@ exit_if_idle_without_sessions() {
   local last_activity now_epoch idle_for
   last_activity="$(latest_activity_epoch)"
   now_epoch="$(date +%s)"
-  idle_for=$(( now_epoch - last_activity ))
 
-  if [ "$last_activity" -eq 0 ] || [ "$idle_for" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
+  # When no activity files exist yet (fresh project or first run), measure idle
+  # time from the observer's own start — prevents immediate self-termination
+  # before any session has had a chance to register a lease.
+  if [ "$last_activity" -eq 0 ] 2>/dev/null; then
+    idle_for=$(( now_epoch - OBSERVER_START_EPOCH ))
+  else
+    idle_for=$(( now_epoch - last_activity ))
+  fi
+
+  if [ "$idle_for" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
     echo "[$(date)] Observer idle without active session leases for ${idle_for}s; exiting" >> "$LOG_FILE"
     cleanup
   fi
@@ -256,7 +282,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 "${CLV2_PYTHON_CMD:-python3}" "${SCRIPT_DIR}/../scripts/instinct-cli.py" prune --quiet >> "$LOG_FILE" 2>&1 || echo "[$(date)] Warning: instinct prune failed (non-fatal)" >> "$LOG_FILE"
 
 while true; do
-  exit_if_idle_without_sessions
   sleep "$OBSERVER_INTERVAL_SECONDS" &
   SLEEP_PID=$!
   wait "$SLEEP_PID" 2>/dev/null
