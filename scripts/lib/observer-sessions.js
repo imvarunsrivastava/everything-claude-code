@@ -139,27 +139,29 @@ function stopObserverForContext(context) {
   if (!fs.existsSync(pidFile)) return false;
 
   const pid = (fs.readFileSync(pidFile, 'utf8') || '').trim();
-  if (!/^[0-9]+$/.test(pid) || pid === '0' || pid === '1') {
+  const pidNum = Number(pid);
+  if (!/^[0-9]+$/.test(pid) || pidNum <= 1 || !Number.isFinite(pidNum)) {
     fs.rmSync(pidFile, { force: true });
     return false;
   }
 
   try {
-    process.kill(Number(pid), 0);
+    process.kill(pidNum, 0);
   } catch {
     fs.rmSync(pidFile, { force: true });
     return false;
   }
 
   try {
-    process.kill(Number(pid), 'SIGTERM');
+    process.kill(pidNum, 'SIGTERM');
+    fs.rmSync(pidFile, { force: true });
+    fs.rmSync(getObserverSignalCounterFile(context), { force: true });
+    return true;
   } catch {
+    // SIGTERM failed (e.g. EPERM); still remove the stale pid file
+    fs.rmSync(pidFile, { force: true });
     return false;
   }
-
-  fs.rmSync(pidFile, { force: true });
-  fs.rmSync(getObserverSignalCounterFile(context), { force: true });
-  return true;
 }
 
 module.exports = {

@@ -145,6 +145,35 @@ test('observer-loop.sh checks session lease directory before self-termination', 
   assert.ok(content.includes('exit_if_idle_without_sessions'), 'observer-loop.sh should define idle self-termination helper');
 });
 
+test('observer-loop.sh uses OBSERVER_START_EPOCH as fallback when no activity files exist', () => {
+  const content = fs.readFileSync(observerLoopPath, 'utf8');
+  assert.ok(content.includes('OBSERVER_START_EPOCH'), 'observer-loop.sh should record observer start time');
+  assert.ok(content.includes('idle_for=$(( now_epoch - OBSERVER_START_EPOCH ))'), 'observer-loop.sh should use start epoch when last_activity is 0');
+  // The old immediate-exit-on-zero condition must not exist
+  assert.ok(!content.includes('[ "$last_activity" -eq 0 ] ||'), 'observer-loop.sh must not exit immediately when last_activity is 0');
+});
+
+test('observer-loop.sh detects stale leases by checking ACTIVITY_FILE mtime', () => {
+  const content = fs.readFileSync(observerLoopPath, 'utf8');
+  assert.ok(content.includes('activity_epoch="$(file_mtime_epoch "$ACTIVITY_FILE")"'), 'has_active_session_leases should consult ACTIVITY_FILE mtime for staleness');
+  assert.ok(content.includes('"$idle_for" -ge "$IDLE_TIMEOUT_SECONDS"'), 'has_active_session_leases should treat leases as stale when activity exceeds timeout');
+});
+
+test('observer-loop.sh detects stat mtime format once at startup', () => {
+  const content = fs.readFileSync(observerLoopPath, 'utf8');
+  assert.ok(content.includes('_STAT_MTIME'), 'observer-loop.sh should cache the stat mtime command');
+  assert.ok(content.includes('$_STAT_MTIME "$file"'), 'file_mtime_epoch should use the cached stat command');
+  // Old double-stat probe pattern must not exist
+  assert.ok(!content.includes('stat -c %Y "$file" >/dev/null 2>&1'), 'file_mtime_epoch must not probe stat format on every call');
+});
+
+test('observer-loop.sh calls exit_if_idle_without_sessions only once per loop iteration', () => {
+  const content = fs.readFileSync(observerLoopPath, 'utf8');
+  const occurrences = (content.match(/exit_if_idle_without_sessions/g) || []).length;
+  // definition + 1 call site in the loop
+  assert.strictEqual(occurrences, 2, `Expected exactly 2 occurrences (definition + 1 call), got ${occurrences}`);
+});
+
 // ──────────────────────────────────────────────────────
 // Test group 4: Tail-based sampling (no full file load)
 // ──────────────────────────────────────────────────────
